@@ -22,7 +22,7 @@ import plot_2D
 import plot_1D
 import model_loader
 import scheduler
-#import mpi4pytorch as mpi
+import mpi4pytorch as mpi
 
 def name_surface_file(args, dir_file):
     # skip if surf_file is specified in args
@@ -70,16 +70,13 @@ def setup_surface_file(args, surf_file, dir_file):
     return surf_file
 
 
-#def crunch(surf_file, net, w, s, d, dataloader, loss_key, acc_key, comm, rank, args):
-
-#   crunch(surf_file, net, w, s, d, trainloader, 'train_loss', 'train_acc', args)
-def crunch(surf_file, net, w, s, d, dataloader, loss_key, acc_key, args):
+def crunch(surf_file, net, w, s, d, dataloader, loss_key, acc_key, comm, rank, args):
     """
         Calculate the loss values and accuracies of modified models in parallel
         using MPI reduce.
     """
 
-    f = h5py.File(surf_file, 'r+')
+    f = h5py.File(surf_file, 'r+' if rank == 0 else 'r')
     losses, accuracies = [], []
     xcoordinates = f['xcoordinates'][:]
     ycoordinates = f['ycoordinates'][:] if 'ycoordinates' in f.keys() else None
@@ -88,8 +85,9 @@ def crunch(surf_file, net, w, s, d, dataloader, loss_key, acc_key, args):
         shape = xcoordinates.shape if ycoordinates is None else (len(xcoordinates),len(ycoordinates))
         losses = -np.ones(shape=shape)
         accuracies = -np.ones(shape=shape)
-        f[loss_key] = losses
-        f[acc_key] = accuracies
+        if rank == 0:
+            f[loss_key] = losses
+            f[acc_key] = accuracies
     else:
         losses = f[loss_key][:]
         accuracies = f[acc_key][:]
@@ -97,8 +95,9 @@ def crunch(surf_file, net, w, s, d, dataloader, loss_key, acc_key, args):
     # Generate a list of indices of 'losses' that need to be filled in.
     # The coordinates of each unfilled index (with respect to the direction vectors
     # stored in 'd') are stored in 'coords'.
-    inds, coords, inds_nums = scheduler.get_job_indices(losses, xcoordinates, ycoordinates, None)
+    inds, coords, inds_nums = scheduler.get_job_indices(losses, xcoordinates, ycoordinates, comm)
 
+    print('Computing %d values for rank %d'% (len(inds), rank))
     start_time = time.time()
     total_sync = 0.0
 
@@ -113,9 +112,9 @@ def crunch(surf_file, net, w, s, d, dataloader, loss_key, acc_key, args):
 
         # Load the weights corresponding to those coordinates into the net
         if args.dir_type == 'weights':
-            net_plotter.set_weights(net, w, d, coord)
+            net_plotter.set_weights(net.module if args.ngpu > 1 else net, w, d, coord)
         elif args.dir_type == 'states':
-            net_plotter.set_states(net, s, d, coord)
+            net_plotter.set_states(net.module if args.ngpu > 1 else net, s, d, coord)
 
         # Record the time to compute the loss value
         loss_start = time.time()
@@ -128,25 +127,29 @@ def crunch(surf_file, net, w, s, d, dataloader, loss_key, acc_key, args):
 
         # Send updated plot data to the master node
         syc_start = time.time()
-        #losses     = mpi.reduce_max(comm, losses)
-        #accuracies = mpi.reduce_max(comm, accuracies)
+        losses     = mpi.reduce_max(comm, losses)
+        accuracies = mpi.reduce_max(comm, accuracies)
         syc_time = time.time() - syc_start
         total_sync += syc_time
 
         # Only the master node writes to the file - this avoids write conflicts
-        f[loss_key][:] = losses
-        f[acc_key][:] = accuracies
-        f.flush()
+        if rank == 0:
+            f[loss_key][:] = losses
+            f[acc_key][:] = accuracies
+            f.flush()
 
-        print('Evaluating  %d/%d  (%.1f%%)  coord=%s \t%s= %.3f \t%s=%.2f \ttime=%.2f \tsync=%.2f' % (
-                count, len(inds), 100.0 * count/len(inds), str(coord), loss_key, loss,
+        print('Evaluating rank %d  %d/%d  (%.1f%%)  coord=%s \t%s= %.3f \t%s=%.2f \ttime=%.2f \tsync=%.2f' % (
+                rank, count, len(inds), 100.0 * count/len(inds), str(coord), loss_key, loss,
                 acc_key, acc, loss_compute_time, syc_time))
 
     # This is only needed to make MPI run smoothly. If this process has less work than
     # the rank0 process, then we need to keep calling reduce so the rank0 process doesn't block
-    
+    for i in range(max(inds_nums) - len(inds)):
+        losses = mpi.reduce_max(comm, losses)
+        accuracies = mpi.reduce_max(comm, accuracies)
+
     total_time = time.time() - start_time
-    print('Total time: %.2f Sync: %.2f' % (total_time, total_sync))
+    print('Rank %d done!  Total time: %.2f Sync: %.2f' % (rank, total_time, total_sync))
 
     f.close()
 
@@ -155,8 +158,10 @@ def crunch(surf_file, net, w, s, d, dataloader, loss_key, acc_key, args):
 ###############################################################
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='plotting loss surface')
-    parser.add_argument('--threads', default=2, type=int, help='number of threads')
+    parser.add_argument('--mpi', '-m', action='store_true', help='use mpi')
     parser.add_argument('--cuda', '-c', action='store_true', help='use cuda')
+    parser.add_argument('--threads', default=2, type=int, help='number of threads')
+    parser.add_argument('--ngpu', type=int, default=1, help='number of GPUs to use for each rank, useful for data parallel evaluation')
     parser.add_argument('--batch_size', default=128, type=int, help='minibatch size')
 
     # data parameters
@@ -180,7 +185,7 @@ if __name__ == '__main__':
     parser.add_argument('--dir_file', default='', help='specify the name of direction file, or the path to an eisting direction file')
     parser.add_argument('--dir_type', default='weights', help='direction type: weights | states (including BN\'s running_mean/var)')
     parser.add_argument('--x', default='-1:1:51', help='A string with format xmin:x_max:xnum')
-    parser.add_argument('--y', default='-1:1:51', help='A string with format ymin:ymax:ynum')
+    parser.add_argument('--y', default=None, help='A string with format ymin:ymax:ynum')
     parser.add_argument('--xnorm', default='', help='direction normalization: filter | layer | weight')
     parser.add_argument('--ynorm', default='', help='direction normalization: filter | layer | weight')
     parser.add_argument('--xignore', default='', help='ignore bias and BN parameters: biasbn')
@@ -202,22 +207,32 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     torch.manual_seed(123)
+    #--------------------------------------------------------------------------
+    # Environment setup
+    #--------------------------------------------------------------------------
+    if args.mpi:
+        comm = mpi.setup_MPI()
+        rank, nproc = comm.Get_rank(), comm.Get_size()
+    else:
+        comm, rank, nproc = None, 0, 1
 
     # in case of multiple GPUs per node, set the GPU to use for each rank
     if args.cuda:
         if not torch.cuda.is_available():
             raise Exception('User selected cuda option, but cuda is not available on this machine')
+        gpu_count = torch.cuda.device_count()
+        torch.cuda.set_device(rank % gpu_count)
+        print('Rank %d use GPU %d of %d GPUs on %s' %
+              (rank, torch.cuda.current_device(), gpu_count, socket.gethostname()))
 
     #--------------------------------------------------------------------------
     # Check plotting resolution
     #--------------------------------------------------------------------------
     try:
         args.xmin, args.xmax, args.xnum = [float(a) for a in args.x.split(':')]
-        args.xnum = int(args.xnum)
         args.ymin, args.ymax, args.ynum = (None, None, None)
         if args.y:
             args.ymin, args.ymax, args.ynum = [float(a) for a in args.y.split(':')]
-            args.ynum = int(args.ynum)
             assert args.ymin and args.ymax and args.ynum, \
             'You specified some arguments for the y axis, but not all'
     except:
@@ -229,20 +244,28 @@ if __name__ == '__main__':
     net = model_loader.load(args.dataset, args.model, args.model_file)
     w = net_plotter.get_weights(net) # initial parameters
     s = copy.deepcopy(net.state_dict()) # deepcopy since state_dict are references
+    if args.ngpu > 1:
+        # data parallel with multiple GPUs on a single node
+        net = nn.DataParallel(net, device_ids=range(torch.cuda.device_count()))
 
     #--------------------------------------------------------------------------
     # Setup the direction file and the surface file
     #--------------------------------------------------------------------------
     dir_file = net_plotter.name_direction_file(args) # name the direction file
-    net_plotter.setup_direction(args, dir_file, net)
+    if rank == 0:
+        net_plotter.setup_direction(args, dir_file, net)
 
     surf_file = name_surface_file(args, dir_file)
-    setup_surface_file(args, surf_file, dir_file)
+    if rank == 0:
+        setup_surface_file(args, surf_file, dir_file)
+
+    # wait until master has setup the direction file and surface file
+    mpi.barrier(comm)
 
     # load directions
     d = net_plotter.load_directions(dir_file)
     # calculate the consine similarity of the two directions
-    if len(d) == 2:
+    if len(d) == 2 and rank == 0:
         similarity = proj.cal_angle(proj.nplist_to_tensor(d[0]), proj.nplist_to_tensor(d[1]))
         print('cosine similarity between x-axis and y-axis: %f' % similarity)
 
@@ -250,10 +273,10 @@ if __name__ == '__main__':
     # Setup dataloader
     #--------------------------------------------------------------------------
     # download CIFAR10 if it does not exit
-    if args.dataset == 'cifar10':
+    if rank == 0 and args.dataset == 'cifar10':
         torchvision.datasets.CIFAR10(root=args.dataset + '/data', train=True, download=True)
-    elif args.dataset == 'cifar100':
-        torchvision.datasets.CIFAR100(root=args.dataset + '/data', train=True, download=True)
+
+    mpi.barrier(comm)
 
     trainloader, testloader = dataloader.load_dataset(args.dataset, args.datapath,
                                 args.batch_size, args.threads, args.raw_data,
@@ -263,13 +286,13 @@ if __name__ == '__main__':
     #--------------------------------------------------------------------------
     # Start the computation
     #--------------------------------------------------------------------------
-    crunch(surf_file, net, w, s, d, trainloader, 'train_loss', 'train_acc', args)
+    crunch(surf_file, net, w, s, d, trainloader, 'train_loss', 'train_acc', comm, rank, args)
     # crunch(surf_file, net, w, s, d, testloader, 'test_loss', 'test_acc', comm, rank, args)
 
     #--------------------------------------------------------------------------
     # Plot figures
     #--------------------------------------------------------------------------
-    if args.plot:
+    if args.plot and rank == 0:
         if args.y and args.proj_file:
             plot_2D.plot_contour_trajectory(surf_file, dir_file, args.proj_file, 'train_loss', args.show)
         elif args.y:
